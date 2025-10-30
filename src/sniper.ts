@@ -18,6 +18,11 @@ export interface SniperConfig {
   rpcUrl: string;
   walletPrivateKey: string;
   openseaApiKey?: string;
+  /**
+   * How long to wait for OpenSea responses before abandoning the request. Keeping this tight
+   * helps reduce total latency introduced by slow network calls.
+   */
+  requestTimeoutMs?: number;
 }
 
 interface Listing {
@@ -55,6 +60,8 @@ export class NftFloorSniper {
   private readonly wallet: ethers.Wallet;
   private readonly seaport: Seaport;
   private pollingHandle?: NodeJS.Timeout;
+  private readonly processedOrders = new Set<string>();
+  private isChecking = false;
 
   constructor(config: SniperConfig) {
     this.config = config;
@@ -81,37 +88,59 @@ export class NftFloorSniper {
   }
 
   private async checkAndSnipe(): Promise<void> {
+    if (this.isChecking) {
+      return;
+    }
+    this.isChecking = true;
+
     try {
-      const floor = await this.fetchFloorPrice();
+      const [floor, listings] = await Promise.all([
+        this.fetchFloorPrice(),
+        this.fetchListings(),
+      ]);
+
       if (!floor) {
         console.warn('Unable to determine floor price, skipping iteration.');
         return;
       }
 
-      const listings = await this.fetchListings();
       const discountFraction = this.toDiscountFraction(this.config.discountPercent);
       const floorWithFees = floor * (1 + OPENSEA_FEE_RATE);
       const targetTotalSpend = floorWithFees * (1 - discountFraction);
 
-      const discounted = listings.filter((listing) => {
-        const totalSpend = this.calculateTotalSpend(listing.price);
-        return totalSpend <= targetTotalSpend && totalSpend <= this.config.maxPriceInEth;
-      });
+      const discounted = listings
+        .filter((listing) => !this.processedOrders.has(listing.orderHash))
+        .filter((listing) => {
+          const totalSpend = this.calculateTotalSpend(listing.price);
+          return totalSpend <= targetTotalSpend && totalSpend <= this.config.maxPriceInEth;
+        })
+        .sort((a, b) => a.price - b.price);
 
-      for (const listing of discounted) {
-        console.log(
-          `Found discounted listing: ${listing.orderHash} @ ${listing.price} ETH (maker: ${listing.maker})`,
-        );
-        await this.executePurchase(listing);
-      }
+      await Promise.all(
+        discounted.map(async (listing) => {
+          console.log(
+            `Found discounted listing: ${listing.orderHash} @ ${listing.price} ETH (maker: ${listing.maker})`,
+          );
+          this.processedOrders.add(listing.orderHash);
+          try {
+            await this.executePurchase(listing);
+          } finally {
+            if (this.processedOrders.size > 500) {
+              this.trimProcessedOrders();
+            }
+          }
+        }),
+      );
     } catch (error) {
       console.error('Polling failed:', error);
+    } finally {
+      this.isChecking = false;
     }
   }
 
   private async fetchFloorPrice(): Promise<number | null> {
     const url = `${OPENSEA_API_BASE}/collections/${this.config.collectionSlug}/stats`;
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       headers: this.buildHeaders(),
     });
 
@@ -128,10 +157,10 @@ export class NftFloorSniper {
       `${OPENSEA_API_BASE}/listings/collection/${this.config.collectionSlug}/all`,
     );
     url.searchParams.set('limit', '50');
-    url.searchParams.set('order_by', 'created_date');
-    url.searchParams.set('order_direction', 'desc');
+    url.searchParams.set('order_by', 'eth_price');
+    url.searchParams.set('order_direction', 'asc');
 
-    const response = await fetch(url, {
+    const response = await this.fetchWithTimeout(url, {
       headers: this.buildHeaders(),
     });
 
@@ -152,6 +181,14 @@ export class NftFloorSniper {
 
   private calculateTotalSpend(listingPrice: number): number {
     return listingPrice * (1 + OPENSEA_FEE_RATE);
+  }
+
+  private trimProcessedOrders(): void {
+    const entries = [...this.processedOrders];
+    this.processedOrders.clear();
+    for (const orderHash of entries.slice(Math.max(0, entries.length - 250))) {
+      this.processedOrders.add(orderHash);
+    }
   }
 
   private toDiscountFraction(discountPercent: number): number {
@@ -192,6 +229,16 @@ export class NftFloorSniper {
 
     return headers;
   }
+
+  private async fetchWithTimeout(resource: string | URL, init?: RequestInit): Promise<Response> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.requestTimeoutMs ?? 4000);
+    try {
+      return await fetch(resource, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
 }
 
 function requireEnv(name: string): string {
@@ -215,6 +262,9 @@ function bootstrap(): void {
     rpcUrl: requireEnv('RPC_URL'),
     walletPrivateKey: requireEnv('WALLET_PRIVATE_KEY'),
     openseaApiKey: process.env.OPENSEA_API_KEY,
+    requestTimeoutMs: process.env.REQUEST_TIMEOUT_MS
+      ? Number(process.env.REQUEST_TIMEOUT_MS)
+      : undefined,
   };
 
   const sniper = new NftFloorSniper(config);
